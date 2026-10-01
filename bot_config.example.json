@@ -1,0 +1,20 @@
+{
+  "enabled": true,
+  "tradovate_env": "demo",
+  "risk_per_trade_usd": 125,
+  "max_risk_per_trade_usd": 250,
+  "max_contracts": 5,
+  "symbol": "MNQZ5",
+  "tick_size": 0.25,
+  "tick_value": 0.50,
+  "accounts": {
+    "demo": {
+      "account_id": null,
+      "account_spec": null
+    },
+    "live": {
+      "account_id": null,
+      "account_spec": null
+    }
+  }
+}

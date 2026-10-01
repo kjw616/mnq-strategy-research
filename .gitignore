@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+.env
+data/*.csv
+data/*.parquet
+data/screenshots/
+.DS_Store
+bot_config.json
+.pytest_cache/
+*.bundle
+TRADING_COACH_PROMPT.md

@@ -1,0 +1,593 @@
+//@version=6
+indicator("Swing Watch v1 (Liq+FVG Dirty-Zone Filter)", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ============================================================================
+// SWING WATCH v1
+// ============================================================================
+// Companion to Liquidity_FVG_v1 - run BOTH on the same chart. That one shows
+// every sweep+FVG entry. This one runs the same detection privately (Pine
+// indicators can't read another script's internal state) but only surfaces
+// and tracks the subset worth extra attention: entries whose retest zone is
+// "dirty" - still has an unswept prior swing point resting inside it.
+//
+// ZONE PURITY: at confirmation, checks whether any still-unswept prior swing
+// point (a resting liquidity level) sits inside the entry FVG. "Dirty" (yes)
+// is the flag - counterintuitively the worse-sounding name is the one worth
+// watching, not the cleaner one.
+//
+// BASE + RUNNER exit (dirty setups only): half the position books the
+// original fixed target, the other half's stop moves up to that same level
+// (can never come back worse than the base win) and trails 2x ATR(15m)
+// behind price until stopped.
+//
+// Backtest history (src/liquidity_fvg_mfe_analysis.csv + swing-scan work),
+// 2023-2024 MNQ 1m, walk-forward checked both years independently:
+//   - 1,060 sweep+FVG signals total, fixed 2.0R target, no time/RR filter.
+//   - Dirty-zone entries: 99 of 1,060 (9.3%) - spread across all 24 months,
+//     not clustered. Win rate 55.6% overall (52.7% '23 / 59.1% '24) vs
+//     50.7% for clean. Avg R 0.667 (fixed target) -> 0.770 with the runner
+//     overlay, a lift concentrated in a handful of trades: 96 of 99 dirty
+//     trades still resolve at exactly -1.0R or +2.0R - only 3 of 99 (3%)
+//     actually ran the runner out further (up to 7.6R). The overlay is a
+//     rare-jackpot tail, not a lift on every winner - go in expecting that.
+//   - Everything else tested first (raw pre-move compression, sweep-of-
+//     recent-range, hour-of-day, day-of-week, counter-trend HTF bias) either
+//     didn't replicate across both years or didn't survive contact with a
+//     real executable exit rule. Zone purity was the one that did, from
+//     every angle tested. Sample is real but not huge (44-55 dirty trades/
+//     year) - a strong lead, not a proven-at-scale edge.
+// ============================================================================
+
+grpGeneral    = "General"
+sessTz        = input.string("America/New_York", "Session Timezone", group = grpGeneral)
+asiaSession   = input.session("1800-0000", "Asia Session Time", group = grpGeneral)
+londonSession = input.session("0200-0500", "London Session Time", group = grpGeneral)
+atrLen        = input.int(14, "ATR Length (label offset only)", group = grpGeneral)
+
+grpTarget      = "Target"
+fixedRTarget   = input.float(2.0, "Fixed R Target (base leg)", step = 0.5, group = grpTarget)
+
+grpPurity      = "Zone Purity / Swing Filter"
+pivotLen       = input.int(3, "Liquidity Pivot Length (bars each side)", group = grpPurity)
+trailAtrMult   = input.float(2.0, "Runner Trail (x ATR, 15m)", step = 0.5, group = grpPurity)
+
+grpFilt        = "Filters"
+useTimeFilter  = input.bool(false, "Only trade NY AM hours", group = grpFilt)
+tradingStartHr = input.int(7, "Trading Window Start Hour (NY, inclusive)", group = grpFilt)
+tradingEndHr   = input.int(10, "Trading Window End Hour (NY, inclusive)", group = grpFilt)
+
+grpAlerts       = "Alerts"
+onlyAlertDirty  = input.bool(true, "Only alert on dirty (swing) setups", group = grpAlerts)
+alertCooldownBars = input.int(15, "Min bars between 'armed' pings (notification-only)", group = grpAlerts)
+
+grpVis           = "Visuals"
+showStatsTable   = input.bool(true, "Show stats table", group = grpVis)
+showCleanEntries = input.bool(false, "Also draw labels/lines for clean (non-swing) entries", group = grpVis)
+showPredictedZone = input.bool(true, "Show predicted entry zone (live, before fill)", group = grpVis)
+debugTable       = input.bool(false, "Show debug table (verification only)", group = grpVis)
+
+atrVal = ta.atr(atrLen)
+atr15m = request.security(syminfo.tickerid, "15", ta.atr(14), lookahead = barmerge.lookahead_off)
+
+// ----------------------------------------------------------------------------
+// Session high/low tracker - same engine as Liquidity_FVG_v1, run privately.
+// ----------------------------------------------------------------------------
+f_sessionLevels(sessString, tz) =>
+    var float sHigh   = na
+    var float sLow    = na
+    var bool  active  = false
+    var bool  hSwept  = false
+    var bool  lSwept  = false
+
+    t    = time(timeframe.period, sessString, tz)
+    isIn = not na(t)
+
+    justHighSwept = false
+    justLowSwept  = false
+
+    if isIn and not active
+        sHigh  := high
+        sLow   := low
+        active := true
+    else if isIn and active
+        sHigh := math.max(sHigh, high)
+        sLow  := math.min(sLow, low)
+    else if not isIn and active
+        active := false
+        hSwept := false
+        lSwept := false
+
+    if not active and not na(sHigh)
+        if not hSwept and high > sHigh
+            hSwept := true
+            justHighSwept := true
+        if not lSwept and low < sLow
+            lSwept := true
+            justLowSwept := true
+
+    [sHigh, sLow, hSwept, lSwept, justHighSwept, justLowSwept]
+
+[asiaHigh, asiaLow, asiaHighSwept, asiaLowSwept, asiaHighJustSwept, asiaLowJustSwept] = f_sessionLevels(asiaSession, sessTz)
+[londonHigh, londonLow, londonHighSwept, londonLowSwept, londonHighJustSwept, londonLowJustSwept] = f_sessionLevels(londonSession, sessTz)
+
+nyHour = hour(time, sessTz)
+
+// ----------------------------------------------------------------------------
+// FVG tracking - same as Liquidity_FVG_v1.
+// ----------------------------------------------------------------------------
+type FVG
+    float top
+    float bottom
+    int   barIndex
+
+var array<FVG> pendingBull = array.new<FVG>()
+var array<FVG> pendingBear = array.new<FVG>()
+
+isBullFVG = high[2] < low
+isBearFVG = low[2] > high
+
+if isBullFVG
+    array.push(pendingBull, FVG.new(low, high[2], bar_index))
+if isBearFVG
+    array.push(pendingBear, FVG.new(low[2], high, bar_index))
+
+if array.size(pendingBull) > 0
+    for i = array.size(pendingBull) - 1 to 0
+        f = array.get(pendingBull, i)
+        if close < f.bottom
+            array.remove(pendingBull, i)
+
+if array.size(pendingBear) > 0
+    for i = array.size(pendingBear) - 1 to 0
+        f = array.get(pendingBear, i)
+        if close > f.top
+            array.remove(pendingBear, i)
+
+// ----------------------------------------------------------------------------
+// Liquidity pool for zone purity - every confirmed pivot high/low stays
+// "active" (still resting, unswept) until price trades beyond it.
+// ta.pivothigh/low only reveal a pivot pivotLen bars after it formed, same
+// non-repainting timing as the Python structure.py port this is based on.
+// ----------------------------------------------------------------------------
+type SwingPt
+    float price
+    string dir  // "high" or "low"
+
+var array<SwingPt> activePts = array.new<SwingPt>()
+
+ph = ta.pivothigh(pivotLen, pivotLen)
+pl = ta.pivotlow(pivotLen, pivotLen)
+
+if not na(ph)
+    array.push(activePts, SwingPt.new(ph, "high"))
+if not na(pl)
+    array.push(activePts, SwingPt.new(pl, "low"))
+
+if array.size(activePts) > 0
+    for i = array.size(activePts) - 1 to 0
+        p = array.get(activePts, i)
+        swept = (p.dir == "high" and high > p.price) or (p.dir == "low" and low < p.price)
+        if swept
+            array.remove(activePts, i)
+
+f_zoneDirty(zTop, zBottom) =>
+    dirty = false
+    if array.size(activePts) > 0
+        for i = 0 to array.size(activePts) - 1
+            p = array.get(activePts, i)
+            if p.price > zBottom and p.price < zTop
+                dirty := true
+    dirty
+
+// ----------------------------------------------------------------------------
+// Setup + trade state
+// ----------------------------------------------------------------------------
+var string setupDir        = na
+var FVG    setupFVG        = na
+var float  setupSL         = na
+var float  setupEntry      = na
+var float  setupTP         = na
+var bool   setupDirty      = false
+var bool   awaitingConfirm = false
+var bool   awaitingRetest  = false
+
+var bool  tradeActive    = false
+var bool  tradeIsLong    = false
+var bool  tradeDirty     = false
+var float tradeEntry     = na
+var float tradeSL        = na
+var float tradeTP        = na
+var int   tradeEntryBar  = na
+
+var bool  runnerActive   = false
+var float runnerStop     = na
+var float runnerExtreme  = na
+var float baseR          = na
+
+var int wins   = 0
+var int losses = 0
+var int dirtyWins   = 0
+var int dirtyLosses = 0
+var float totalR       = 0.0
+var int   closedTrades = 0
+var float dirtyTotalR  = 0.0
+var int   dirtyClosed  = 0
+var float bestSwingR    = 0.0
+var int   curStreak     = 0     // +N winning, -N losing (dirty trades only)
+var int   maxWinStreak  = 0
+var int   maxLossStreak = 0
+var int skippedByFilter = 0
+
+f_passesFilters() =>
+    not useTimeFilter or (nyHour >= tradingStartHr and nyHour <= tradingEndHr)
+
+lowSweptNow    = asiaLowJustSwept or londonLowJustSwept
+highSweptNow   = asiaHighJustSwept or londonHighJustSwept
+sweptLowLevel  = asiaLowJustSwept ? asiaLow : londonLow
+sweptHighLevel = asiaHighJustSwept ? asiaHigh : londonHigh
+
+// anchor a new long setup off a fresh low sweep (only when flat)
+if lowSweptNow and not awaitingConfirm and not awaitingRetest and not tradeActive and array.size(pendingBear) > 0
+    setupFVG := array.get(pendingBear, array.size(pendingBear) - 1)
+    array.remove(pendingBear, array.size(pendingBear) - 1)
+    setupDir        := "long"
+    setupSL         := sweptLowLevel
+    awaitingConfirm := true
+
+// anchor a new short setup off a fresh high sweep (only when flat)
+if highSweptNow and not awaitingConfirm and not awaitingRetest and not tradeActive and array.size(pendingBull) > 0
+    setupFVG := array.get(pendingBull, array.size(pendingBull) - 1)
+    array.remove(pendingBull, array.size(pendingBull) - 1)
+    setupDir        := "short"
+    setupSL         := sweptHighLevel
+    awaitingConfirm := true
+
+var bool justInvalidated = false
+justInvalidated := false
+
+if awaitingConfirm or awaitingRetest
+    if setupDir == "long" and highSweptNow
+        if awaitingRetest
+            justInvalidated := true
+        awaitingConfirm := false
+        awaitingRetest  := false
+        setupFVG        := na
+    else if setupDir == "short" and lowSweptNow
+        if awaitingRetest
+            justInvalidated := true
+        awaitingConfirm := false
+        awaitingRetest  := false
+        setupFVG        := na
+
+var bool justArmed = false
+justArmed := false
+
+if awaitingConfirm and not na(setupFVG)
+    if setupDir == "long" and close > setupFVG.top
+        entryCandidate = (setupFVG.top + setupFVG.bottom) / 2
+        tp = entryCandidate + fixedRTarget * math.abs(entryCandidate - setupSL)
+        awaitingConfirm := false
+        if not f_passesFilters()
+            setupFVG := na
+            skippedByFilter += 1
+        else
+            awaitingRetest := true
+            setupEntry := entryCandidate
+            setupTP    := tp
+            setupDirty := f_zoneDirty(setupFVG.top, setupFVG.bottom)
+            justArmed  := true
+    else if setupDir == "short" and close < setupFVG.bottom
+        entryCandidate = (setupFVG.top + setupFVG.bottom) / 2
+        tp = entryCandidate - fixedRTarget * math.abs(entryCandidate - setupSL)
+        awaitingConfirm := false
+        if not f_passesFilters()
+            setupFVG := na
+            skippedByFilter += 1
+        else
+            awaitingRetest := true
+            setupEntry := entryCandidate
+            setupTP    := tp
+            setupDirty := f_zoneDirty(setupFVG.top, setupFVG.bottom)
+            justArmed  := true
+
+// ----------------------------------------------------------------------------
+// Predicted entry zone - the whole point of "predicting" instead of just
+// confirming: this box appears the instant a setup is armed (sweep + FVG +
+// purity check all done), well before the retracement that actually fills
+// it. It grows bar-by-bar while price approaches, so the prediction is
+// something you can see and act on live, not just an alert you missed.
+// ----------------------------------------------------------------------------
+var box predictBox = na
+
+if justArmed and (setupDirty or showCleanEntries) and showPredictedZone
+    boxColor = setupDirty ? #dda647 : (setupDir == "long" ? color.green : color.red)
+    predictTxt = "🔮 PREDICTED " + (setupDir == "long" ? "LONG" : "SHORT") + (setupDirty ? " · 🌊 SWING" : "")
+    predictBox := box.new(bar_index, setupFVG.top, bar_index, setupFVG.bottom,
+      border_color = boxColor, border_width = 2, bgcolor = color.new(boxColor, 85),
+      text = predictTxt, text_color = boxColor, text_size = size.tiny,
+      text_halign = text.align_left, text_valign = text.align_top)
+
+// entry trigger: retracement back into the inverted FVG
+var bool justEntered = false
+justEntered := false
+
+if awaitingRetest and not na(setupFVG)
+    inZone = low <= setupFVG.top and high >= setupFVG.bottom
+    if inZone
+        justEntered    := true
+        awaitingRetest := false
+
+// keep the predicted-zone box growing while the setup is still live, then
+// freeze it with a result color the moment it either fills or dies -
+// gold/green/red solid if it filled (matches the eventual trade), dim gray
+// if it was predicted but never got retraced into. Leaves a visible track
+// record of hits vs misses on the chart.
+if not na(predictBox)
+    if justEntered or justInvalidated
+        box.set_right(predictBox, bar_index)
+        resultColor = justEntered ? (setupDirty ? #dda647 : (setupDir == "long" ? color.green : color.red)) : color.gray
+        box.set_border_color(predictBox, resultColor)
+        box.set_bgcolor(predictBox, color.new(resultColor, justEntered ? 75 : 92))
+        predictBox := na
+    else if awaitingRetest
+        box.set_right(predictBox, bar_index)
+
+if justEntered
+    tradeActive   := true
+    tradeIsLong   := setupDir == "long"
+    tradeDirty    := setupDirty
+    tradeEntry    := setupEntry
+    tradeSL       := setupSL
+    tradeTP       := setupTP
+    tradeEntryBar := bar_index
+    runnerActive  := false
+    runnerStop    := na
+    baseR         := na
+    setupFVG      := na
+
+    if tradeDirty
+        dirTxt = tradeIsLong ? "🟢 LONG" : "🔴 SHORT"
+        txt = "🌊 SWING WATCH · " + dirTxt + "\n💎 DIRTY ZONE (unswept liquidity inside)" +
+          "\n📍 Entry " + str.tostring(tradeEntry, format.mintick) +
+          "\n🛑 SL " + str.tostring(tradeSL, format.mintick) + "\n🎯 Base TP " + str.tostring(tradeTP, format.mintick)
+        label.new(bar_index, tradeIsLong ? low - atrVal * 0.75 : high + atrVal * 0.75, txt,
+          style = tradeIsLong ? label.style_label_up : label.style_label_down,
+          color = color.new(#dda647, 0), textcolor = color.black, size = size.small)
+    else if showCleanEntries
+        dirTxt = tradeIsLong ? "🟢 LONG" : "🔴 SHORT"
+        txt = dirTxt + "\n⚪ clean zone (not a swing candidate)\n📍 Entry " + str.tostring(tradeEntry, format.mintick) +
+          "\n🛑 SL " + str.tostring(tradeSL, format.mintick) + "\n🎯 TP " + str.tostring(tradeTP, format.mintick)
+        label.new(bar_index, tradeIsLong ? low - atrVal * 0.75 : high + atrVal * 0.75, txt,
+          style = tradeIsLong ? label.style_label_up : label.style_label_down,
+          color = color.new(tradeIsLong ? color.green : color.red, 0), textcolor = color.white, size = size.small)
+
+// ----------------------------------------------------------------------------
+// Trade lines while active - only drawn for dirty (swing) trades by default,
+// since the base indicator already shows every trade's lines. A live
+// runner-trail line appears once the base leg locks in.
+// ----------------------------------------------------------------------------
+var line entryLine  = na
+var line slLine     = na
+var line tpLine     = na
+var line runnerLine = na
+
+drawLines = tradeDirty or showCleanEntries
+
+if justEntered and drawLines
+    entryLine := line.new(tradeEntryBar, tradeEntry, bar_index, tradeEntry, color = color.white, style = line.style_dotted)
+    slLine    := line.new(tradeEntryBar, tradeSL, bar_index, tradeSL, color = color.red, style = line.style_dashed)
+    tpLine    := line.new(tradeEntryBar, tradeTP, bar_index, tradeTP, color = color.green, style = line.style_dashed)
+else if tradeActive and drawLines and not na(entryLine)
+    line.set_x2(entryLine, bar_index)
+    line.set_x2(slLine, bar_index)
+    line.set_x2(tpLine, bar_index)
+    if runnerActive
+        if na(runnerLine)
+            runnerLine := line.new(bar_index - 1, runnerStop, bar_index, runnerStop, color = #dda647, style = line.style_solid, width = 2)
+        else
+            line.set_x2(runnerLine, bar_index)
+            line.set_y2(runnerLine, runnerStop)
+
+// ----------------------------------------------------------------------------
+// Resolve trades. Clean setups: flat fixed target (tracked for stats only,
+// not the focus of this indicator). Dirty setups: base leg locks at the
+// fixed target, remainder trails 2x ATR(15m) - can never close worse than
+// the base leg once activated.
+// ----------------------------------------------------------------------------
+bool   tradeClosed = false
+string closeText   = na
+float  closeR      = na
+bool   justRunnerArmed = false
+
+if tradeActive
+    risk = math.abs(tradeEntry - tradeSL)
+
+    if not tradeDirty
+        hitSL = tradeIsLong ? low <= tradeSL : high >= tradeSL
+        hitTP = tradeIsLong ? high >= tradeTP : low <= tradeTP
+        if hitSL
+            losses += 1
+            tradeClosed := true
+            closeR      := -1.0
+            closeText   := "❌ LOSS -1.00R"
+            tradeActive := false
+        else if hitTP
+            wins += 1
+            r = risk > 0 ? (tradeIsLong ? (tradeTP - tradeEntry) / risk : (tradeEntry - tradeTP) / risk) : na
+            tradeClosed := true
+            closeR      := r
+            closeText   := "✅ WIN +" + str.tostring(r, "#.00") + "R"
+            tradeActive := false
+    else if not runnerActive
+        hitSL = tradeIsLong ? low <= tradeSL : high >= tradeSL
+        hitTP = tradeIsLong ? high >= tradeTP : low <= tradeTP
+        if hitSL
+            losses += 1
+            dirtyLosses += 1
+            tradeClosed := true
+            closeR      := -1.0
+            closeText   := "❌ LOSS -1.00R"
+            tradeActive := false
+        else if hitTP
+            baseR         := risk > 0 ? (tradeIsLong ? (tradeTP - tradeEntry) / risk : (tradeEntry - tradeTP) / risk) : na
+            runnerActive  := true
+            runnerStop    := tradeTP
+            runnerExtreme := tradeTP
+            justRunnerArmed := true
+    else
+        if tradeIsLong
+            runnerExtreme := math.max(runnerExtreme, high)
+            runnerStop    := math.max(runnerStop, runnerExtreme - trailAtrMult * atr15m)
+        else
+            runnerExtreme := math.min(runnerExtreme, low)
+            runnerStop    := math.min(runnerStop, runnerExtreme + trailAtrMult * atr15m)
+
+        hitRunnerStop = tradeIsLong ? low <= runnerStop : high >= runnerStop
+        if hitRunnerStop
+            runnerR = risk > 0 ? (tradeIsLong ? (runnerStop - tradeEntry) / risk : (tradeEntry - runnerStop) / risk) : na
+            r = 0.5 * baseR + 0.5 * runnerR
+            wins += 1
+            dirtyWins += 1
+            tradeClosed  := true
+            closeR       := r
+            closeText    := "🌊 SWING WIN +" + str.tostring(r, "#.00") + "R"
+            tradeActive  := false
+            runnerActive := false
+
+if justRunnerArmed
+    label.new(bar_index, tradeIsLong ? tradeTP + atrVal * 0.5 : tradeTP - atrVal * 0.5, "🏃 BASE LOCKED — RIDING 🌊",
+      style = label.style_label_down, color = color.new(#dda647, 0), textcolor = color.black, size = size.tiny)
+
+if tradeClosed
+    totalR += closeR
+    closedTrades += 1
+    if tradeDirty
+        dirtyTotalR += closeR
+        dirtyClosed += 1
+        bestSwingR := math.max(bestSwingR, closeR)
+        if closeR > 0
+            curStreak := curStreak >= 0 ? curStreak + 1 : 1
+            maxWinStreak := math.max(maxWinStreak, curStreak)
+        else
+            curStreak := curStreak <= 0 ? curStreak - 1 : -1
+            maxLossStreak := math.max(maxLossStreak, -curStreak)
+
+    if tradeDirty or showCleanEntries
+        label.new(bar_index, closeR > 0 ? high + atrVal : low - atrVal, closeText,
+          style = closeR > 0 ? label.style_label_down : label.style_label_up,
+          color = color.new(closeR > 0 ? (tradeDirty ? #dda647 : color.green) : color.red, 0),
+          textcolor = closeR > 0 and tradeDirty ? color.black : color.white, size = size.small)
+    entryLine  := na
+    slLine     := na
+    tpLine     := na
+    runnerLine := na
+
+resolvedTrades = wins + losses
+winrate = resolvedTrades > 0 ? wins * 100.0 / resolvedTrades : na
+dirtyResolved = dirtyWins + dirtyLosses
+dirtyWinrate = dirtyResolved > 0 ? dirtyWins * 100.0 / dirtyResolved : na
+avgR = closedTrades > 0 ? totalR / closedTrades : na
+dirtyAvgR = dirtyClosed > 0 ? dirtyTotalR / dirtyClosed : na
+
+// ----------------------------------------------------------------------------
+// Dashboard - swing/dirty stats front and center; overall record kept as
+// secondary context only.
+// ----------------------------------------------------------------------------
+chartTfOk = timeframe.period == "1" or timeframe.period == "5"
+
+f_purityText(dir, dirty) => na(dir) ? "—" : dirty ? "💎 DIRTY (swing candidate)" : "⚪ clean (no signal)"
+f_purityColor(dir, dirty) => na(dir) ? color.gray : dirty ? #dda647 : color.gray
+f_dirText(dir) => dir == "long" ? "🟢 LONG" : dir == "short" ? "🔴 SHORT" : "— none —"
+f_dirColor(dir) => dir == "long" ? color.lime : dir == "short" ? color.red : color.gray
+
+if showStatsTable and barstate.islast
+    var table dash = table.new(position.top_right, 2, 10, border_width = 1, border_color = #000000, frame_width = 1, frame_color = #000000, bgcolor = #131722)
+    bgSolid = #131722
+    curDirVal = tradeActive ? (tradeIsLong ? "long" : "short") : setupDir
+    curDirtyVal = tradeActive ? tradeDirty : setupDirty
+    stateText = tradeActive ? (not tradeDirty ? "👀 Watching (clean)" : runnerActive ? "🌊 Riding Runner" : "💰 Base Active") : awaitingRetest ? "⏳ Awaiting retest" : awaitingConfirm ? "🔎 Awaiting confirm" : "🔍 Searching"
+    streakText = curStreak == 0 ? "—" : curStreak > 0 ? str.tostring(curStreak) + "W 🔥" : str.tostring(-curStreak) + "L"
+
+    table.cell(dash, 0, 0, "🌊 Swing Watch v1", text_color = color.white, bgcolor = #3a2e14, text_size = size.tiny)
+    table.cell(dash, 1, 0, syminfo.ticker + " " + timeframe.period + (chartTfOk ? "" : " ⚠"), text_color = color.white, bgcolor = #3a2e14, text_size = size.tiny)
+
+    table.cell(dash, 0, 1, "Status", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 1, stateText, text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 2, "Zone Purity", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 2, f_purityText(curDirVal, curDirtyVal), text_color = f_purityColor(curDirVal, curDirtyVal), bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 3, "Setup Dir / Entry-SL-TP", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 3, f_dirText(curDirVal) + "  " + (na(tradeEntry) ? "-" : str.tostring(tradeEntry, format.mintick) + "/" + str.tostring(tradeSL, format.mintick) + "/" + str.tostring(tradeTP, format.mintick)), text_color = f_dirColor(curDirVal), bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 4, "🌊 Dirty Record", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 4, str.tostring(dirtyWins) + "W " + str.tostring(dirtyLosses) + "L (" + (not na(dirtyWinrate) ? str.tostring(dirtyWinrate, "#.0") + "%" : "N/A") + ")", text_color = #dda647, bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 5, "🌊 Avg R / Best", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 5, (not na(dirtyAvgR) ? str.tostring(dirtyAvgR, "#.00") + "R" : "-") + " avg · +" + str.tostring(bestSwingR, "#.00") + "R best", text_color = #dda647, bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 6, "Streak (dirty)", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 6, "now " + streakText + " · max " + str.tostring(maxWinStreak) + "W/" + str.tostring(maxLossStreak) + "L", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 7, "All signals (context)", text_color = color.gray, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 7, str.tostring(wins) + "W " + str.tostring(losses) + "L (" + (not na(winrate) ? str.tostring(winrate, "#.0") + "%" : "N/A") + ") · " + (not na(avgR) ? str.tostring(avgR, "#.00") + "R avg" : "-"), text_color = color.gray, bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 8, "Liquidity pool", text_color = color.gray, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 8, str.tostring(array.size(activePts)) + " active levels", text_color = color.gray, bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 9, "Timeframe", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 9, chartTfOk ? "OK (" + timeframe.period + "m)" : "⚠ built for 1m/5m", text_color = chartTfOk ? color.lime : color.orange, bgcolor = bgSolid, text_size = size.tiny)
+
+// ----------------------------------------------------------------------------
+// Optional debug table
+// ----------------------------------------------------------------------------
+var table dbg = table.new(position.bottom_right, 2, 5, border_width = 1)
+
+if debugTable and barstate.islast
+    table.cell(dbg, 0, 0, "Level", bgcolor = color.gray)
+    table.cell(dbg, 1, 0, "Value", bgcolor = color.gray)
+    table.cell(dbg, 0, 1, "Asia H/L")
+    table.cell(dbg, 1, 1, str.tostring(asiaHigh) + " / " + str.tostring(asiaLow))
+    table.cell(dbg, 0, 2, "London H/L")
+    table.cell(dbg, 1, 2, str.tostring(londonHigh) + " / " + str.tostring(londonLow))
+    table.cell(dbg, 0, 3, "ATR 15m (runner trail basis)")
+    table.cell(dbg, 1, 3, str.tostring(atr15m))
+    table.cell(dbg, 0, 4, "Skipped (filtered)")
+    table.cell(dbg, 1, 4, str.tostring(skippedByFilter))
+
+// ----------------------------------------------------------------------------
+// Alerts - default to dirty-only, since the base indicator already covers
+// every entry. "Armed" fires the moment the entry zone is known, before the
+// retracement happens.
+// ----------------------------------------------------------------------------
+var int  lastAlertBar       = na
+var bool lastArmWasNotified = false
+
+if justArmed
+    notifyThis = (not onlyAlertDirty or setupDirty) and (na(lastAlertBar) or (bar_index - lastAlertBar) >= alertCooldownBars)
+    tagTxt = setupDirty ? "🌊 SWING SETUP (💎 dirty zone)" : "Setup (clean, not a swing candidate)"
+    if setupDir == "long"
+        longMsg = "🟢 " + tagTxt + " " + syminfo.ticker + " LONG\n📍 Limit Buy: " + str.tostring(setupEntry, format.mintick) +
+          "\n🛑 Stop: " + str.tostring(setupSL, format.mintick) + "\n🎯 Base Target: " + str.tostring(setupTP, format.mintick) +
+          (setupDirty ? "\n🏃 Runner: trails " + str.tostring(trailAtrMult) + "x ATR(15m) once target hits" : "")
+        if notifyThis
+            alert(longMsg, alert.freq_once_per_bar)
+    else
+        shortMsg = "🔴 " + tagTxt + " " + syminfo.ticker + " SHORT\n📍 Limit Sell: " + str.tostring(setupEntry, format.mintick) +
+          "\n🛑 Stop: " + str.tostring(setupSL, format.mintick) + "\n🎯 Base Target: " + str.tostring(setupTP, format.mintick) +
+          (setupDirty ? "\n🏃 Runner: trails " + str.tostring(trailAtrMult) + "x ATR(15m) once target hits" : "")
+        if notifyThis
+            alert(shortMsg, alert.freq_once_per_bar)
+    if notifyThis
+        lastAlertBar := bar_index
+    lastArmWasNotified := notifyThis
+
+if justInvalidated and lastArmWasNotified
+    if setupDir == "long"
+        alert("⚪ " + syminfo.ticker + " LONG invalidated\n❌ Cancel your resting BUY order", alert.freq_once_per_bar)
+    else
+        alert("⚪ " + syminfo.ticker + " SHORT invalidated\n❌ Cancel your resting SELL order", alert.freq_once_per_bar)
+
+alertcondition(justEntered and tradeDirty and tradeIsLong, title = "🌊 Swing Long Entry (dirty, filled)", message = "🌊 DIRTY-ZONE LONG filled — base+runner active")
+alertcondition(justEntered and tradeDirty and not tradeIsLong, title = "🌊 Swing Short Entry (dirty, filled)", message = "🌊 DIRTY-ZONE SHORT filled — base+runner active")
+alertcondition(justRunnerArmed, title = "🏃 Runner Activated", message = "🏃 Base target hit — runner now trailing")

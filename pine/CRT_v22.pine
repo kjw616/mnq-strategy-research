@@ -1,0 +1,338 @@
+//@version=6
+indicator("CRT v22 - 1H Bias / 1min Entry", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ============================================================================
+// CRT v22 - 1H BIAS, 1-MINUTE ENTRY
+// ============================================================================
+// Third architecture. v21 (single timeframe) and the "any HTF as bias" build
+// both got backtested against 2 years of MNQ data; only 1H bias survived a
+// walk-forward check (tuned on 2023, tested untouched on 2024) - 15min and
+// 30min both looked profitable over the full 2 years but flipped to
+// breakeven-or-worse on 2024 alone, the textbook sign of curve-fitting. 1H
+// held up in BOTH halves across a wide range of parameter choices. This
+// script is built ONLY around that validated shape - run it on a 1-MINUTE
+// CHART. The bias timeframe input defaults to 1H for that reason; changing
+// it goes back to being unvalidated.
+//
+// CRT is confluence here, not the entry vehicle - same relationship your
+// ICT script has with market structure bias. It never wins or loses on its
+// own:
+//   1. On the 1H bias timeframe: C1 (large-bodied) + C2 (small-bodied sweep,
+//      closes back inside C1's range) forms a candidate. It only counts if
+//      C1's swept side is a genuine local extreme (liquidityLookback bars,
+//      not just any candle) AND the 1H/4H EMA-cross bias agrees with its
+//      direction - raw C1+C2 alone fires far too often to trust alone.
+//   2. That candidate becomes LIVE bias only once 1H price closes beyond
+//      its own C2 opposite wick within the reaction window - proving real
+//      follow-through. Bias stays live until price reclaims the original
+//      swept extreme (thesis dead) or a fresh candidate independently
+//      reacts in either direction.
+//   3. While bias is live, EVERY 1-minute close that crosses C2's opposite
+//      wick by at least a small ATR margin (not a bare tick-cross - that
+//      was letting the stop get chopped by ordinary noise) is a fresh
+//      entry. Several trades per bias window, not one-and-done.
+//   4. Stop is tame and 1-minute-native: entry bar's own high/low + an ATR
+//      buffer. No fixed target - an ATR chandelier trailing stop rides the
+//      move and only ever ratchets in the trade's favor, so a trade that
+//      runs can realize a large R instead of being capped at a fixed
+//      multiple.
+//
+// HOW TO GET PHONE ALERTS:
+//   1. Add this indicator to a 1-MINUTE chart.
+//   2. Right-click chart -> Add Alert.
+//   3. Condition = this indicator, choose "CRT Bias Long Entry" or
+//      "CRT Bias Short Entry".
+//   4. Trigger = "Once Per Bar Close".
+//   5. Under Notifications, check "App notification".
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// INPUTS
+// ----------------------------------------------------------------------------
+grpBias = "Bias Timeframe (validated: 1H only)"
+biasTF        = input.timeframe("60", "Bias TF - changing this leaves validated territory", group = grpBias)
+emaLen        = input.int(50, "1H/4H EMA Length (bias agreement)", group = grpBias)
+
+grpPattern = "CRT Pattern (on the bias TF)"
+c1MinAtrMult      = input.float(0.8, "Min C1 range (x bias-TF ATR)", minval = 0, group = grpPattern)
+c1MinBodyRatio    = input.float(0.6, "Min C1 body:range ratio", minval = 0, maxval = 1, group = grpPattern)
+c2MaxBodyRatio    = input.float(0.5, "Max C2 body:range ratio (small-body sweep candle)", minval = 0, maxval = 1, group = grpPattern)
+liquidityLookback = input.int(10, "C1 liquidity lookback (bars, on bias TF)", minval = 1, group = grpPattern)
+reactionWindowMin = input.int(90, "Candidate -> confirmed bias reaction window (minutes)", minval = 1, group = grpPattern)
+
+grpEntry = "1-Minute Entry"
+ltfAtrLen          = input.int(14, "1-minute ATR length", group = grpEntry)
+ltfMomentumAtrMult = input.float(0.15, "Min displacement past C2's opposite wick (x 1min ATR)", minval = 0, group = grpEntry)
+stopBufferAtr      = input.float(1.5, "Stop buffer beyond entry bar's own high/low (x 1min ATR)", minval = 0, group = grpEntry)
+trailAtrMult       = input.float(8.0, "Chandelier trailing distance (x 1min ATR)", minval = 0, group = grpEntry)
+
+grpVis = "Visuals"
+showTradeLines = input.bool(true, "Show entry/stop/trail lines", group = grpVis)
+suggestedTpR   = input.float(2.0, "Suggested TP line (R multiple - informational only, NOT the real exit)", minval = 0.1, group = grpVis)
+showStatsTable = input.bool(true, "Show status table", group = grpVis)
+bullColor      = input.color(color.new(color.teal, 0), "Bullish color", group = grpVis)
+bearColor      = input.color(color.new(color.red, 0), "Bearish color", group = grpVis)
+
+// ----------------------------------------------------------------------------
+// CHART TF GUARD - this strategy's entries are 1-minute-native; running it
+// on anything else changes what the stop/trail/momentum inputs actually mean
+// ----------------------------------------------------------------------------
+chartIsOneMin = timeframe.in_seconds() <= 60
+
+// ----------------------------------------------------------------------------
+// BIAS-TF CONTEXT (pulled once per bias-TF bar close, lookahead off so it
+// can never repaint intrabar)
+// ----------------------------------------------------------------------------
+f_biasCtx(atrLen, liqLen) =>
+    [high, high[1], high[2], low, low[1], low[2], open[1], open[2], close, close[1], close[2], time,
+     ta.atr(atrLen), ta.highest(high, liqLen)[2], ta.lowest(low, liqLen)[2]]
+
+[h0, h1, h2, l0, l1, l2, o1, o2, c0, cc1, cc2, t0, biasAtr, trailHighAtC1, trailLowAtC1] = request.security(syminfo.tickerid, biasTF, f_biasCtx(14, liquidityLookback), lookahead = barmerge.lookahead_off)
+
+// 1H/4H EMA-cross agreement (same construct as v21 - now used purely as a
+// confluence gate on the bias candidate, not the primary bias itself)
+htf1Close = request.security(syminfo.tickerid, "60", close[1], lookahead = barmerge.lookahead_off)
+htf1Ema   = request.security(syminfo.tickerid, "60", ta.ema(close, emaLen)[1], lookahead = barmerge.lookahead_off)
+htf4Close = request.security(syminfo.tickerid, "240", close[1], lookahead = barmerge.lookahead_off)
+htf4Ema   = request.security(syminfo.tickerid, "240", ta.ema(close, emaLen)[1], lookahead = barmerge.lookahead_off)
+
+bias1H = htf1Close > htf1Ema ? 1 : htf1Close < htf1Ema ? -1 : 0
+bias4H = htf4Close > htf4Ema ? 1 : htf4Close < htf4Ema ? -1 : 0
+emaAgreeDir = bias4H != 0 ? bias4H : bias1H
+
+f_biasText(b) =>
+    b == 1 ? "🟢 Bullish" : b == -1 ? "🔴 Bearish" : "⚪ Neutral"
+
+f_biasColor(b) =>
+    b == 1 ? color.new(color.lime, 0) : b == -1 ? color.new(color.red, 0) : color.new(color.gray, 0)
+
+// ----------------------------------------------------------------------------
+// PERSISTENT BIAS STATE (updated once per new bias-TF bar close)
+// ----------------------------------------------------------------------------
+var int   biasBarIdx = 0
+var float lastBiasT  = na
+
+var int   curDir  = 0
+var float curHigh = na
+var float curLow  = na
+
+var int   pendDir  = 0
+var float pendHigh = na
+var float pendLow  = na
+var int   pendBar  = na
+
+reactionWindowBars = int(math.max(1, math.round(reactionWindowMin / (timeframe.in_seconds(biasTF) / 60))))
+
+newBiasBar = t0 != lastBiasT
+
+if newBiasBar
+    biasBarIdx += 1
+
+    c1High = h2
+    c1Low  = l2
+    c1Open = o2
+    c1Close = cc2
+    c2High = h1
+    c2Low  = l1
+    c2Open = o1
+    c2Close = cc1
+
+    doubleSweep = (c2High > c1High) and (c2Low < c1Low)
+    c1Range = c1High - c1Low
+    c1Ratio = c1Range != 0 ? math.abs(c1Close - c1Open) / c1Range : 0.0
+    c1Valid = c1Range > biasAtr * c1MinAtrMult and c1Ratio > c1MinBodyRatio
+
+    bearSweep = c2High > c1High and c2Close < c1High
+    bullSweep = c2Low  < c1Low  and c2Close > c1Low
+
+    c2Range = c2High - c2Low
+    c2Ratio = c2Range != 0 ? math.abs(c2Close - c2Open) / c2Range : 0.0
+    c2SmallBody = c2Ratio <= c2MaxBodyRatio
+
+    c1IsSwingHigh = c1High >= trailHighAtC1
+    c1IsSwingLow  = c1Low  <= trailLowAtC1
+
+    bullCrt = c1Valid and bullSweep and c2SmallBody and c1IsSwingLow and not doubleSweep
+    bearCrt = c1Valid and bearSweep and c2SmallBody and c1IsSwingHigh and not doubleSweep
+
+    // --- pending candidate: only starts if it agrees with the EMA bias ---
+    if bullCrt and emaAgreeDir == 1
+        pendDir  := 1
+        pendHigh := c2High
+        pendLow  := c2Low
+        pendBar  := biasBarIdx
+    else if bearCrt and emaAgreeDir == -1
+        pendDir  := -1
+        pendHigh := c2High
+        pendLow  := c2Low
+        pendBar  := biasBarIdx
+    else if pendDir != 0
+        reacted = pendDir == 1 ? c0 > pendHigh : c0 < pendLow
+        if reacted
+            curDir  := pendDir
+            curHigh := pendHigh
+            curLow  := pendLow
+            pendDir := 0
+        else if biasBarIdx - pendBar > reactionWindowBars
+            pendDir := 0
+
+    // --- invalidation: price reclaims the original swept extreme ---
+    if curDir == 1 and not na(curLow) and c0 < curLow
+        curDir := 0
+    else if curDir == -1 and not na(curHigh) and c0 > curHigh
+        curDir := 0
+
+    lastBiasT := t0
+
+// ----------------------------------------------------------------------------
+// 1-MINUTE ENTRY + TRADE RESOLUTION (native to whatever chart TF this runs
+// on - meant to be 1 minute; see the chart-TF guard above)
+// ----------------------------------------------------------------------------
+atr1m = ta.atr(ltfAtrLen)
+
+var bool  active      = false
+var float entryPrice  = na
+var float stopPrice   = na
+var float initStop    = na
+var float suggestedTp = na
+var bool  isLong      = false
+var float runExtreme  = na
+var int   entryBar    = na
+
+var int wins   = 0
+var int losses = 0
+var int trades = 0
+
+bool longTrig   = false
+bool shortTrig  = false
+bool tradeClosed = false
+string closeText = na
+float  closeR     = na
+
+if barstate.isconfirmed and chartIsOneMin
+    if not active
+        momentum = atr1m * ltfMomentumAtrMult
+        bullEntry = curDir == 1 and not na(curHigh) and close[1] <= (curHigh + momentum) and close > (curHigh + momentum)
+        bearEntry = curDir == -1 and not na(curLow) and close[1] >= (curLow - momentum) and close < (curLow - momentum)
+
+        if bullEntry or bearEntry
+            buf = atr1m * stopBufferAtr
+            candidateEntry = close
+            candidateStop  = bullEntry ? low - buf : high + buf
+            if candidateStop != candidateEntry
+                entryPrice  := candidateEntry
+                stopPrice   := candidateStop
+                initStop    := candidateStop
+                riskPtsAtEntry = math.abs(candidateEntry - candidateStop)
+                suggestedTp := bullEntry ? candidateEntry + riskPtsAtEntry * suggestedTpR : candidateEntry - riskPtsAtEntry * suggestedTpR
+                isLong      := bullEntry
+                runExtreme  := bullEntry ? high : low
+                entryBar    := bar_index
+                active      := true
+                trades      += 1
+                longTrig    := bullEntry
+                shortTrig   := not bullEntry
+
+    else if active
+        bool hitStop = false
+        if isLong
+            runExtreme := math.max(runExtreme, high)
+            trailCandidate = runExtreme - trailAtrMult * atr1m
+            stopPrice := math.max(stopPrice, trailCandidate)
+            hitStop := low <= stopPrice
+        else
+            runExtreme := math.min(runExtreme, low)
+            trailCandidate = runExtreme + trailAtrMult * atr1m
+            stopPrice := math.min(stopPrice, trailCandidate)
+            hitStop := high >= stopPrice
+
+        if hitStop
+            riskPts = math.abs(entryPrice - initStop)
+            r = isLong ? (stopPrice - entryPrice) / riskPts : (entryPrice - stopPrice) / riskPts
+            if r > 0
+                wins += 1
+            else
+                losses += 1
+            active     := false
+            tradeClosed := true
+            closeR      := r
+            closeText   := (r > 0 ? "✅ WIN " : "❌ LOSS ") + str.tostring(r, "#.00") + "R"
+
+resolvedTrades = wins + losses
+winrate = resolvedTrades > 0 ? wins * 100.0 / resolvedTrades : na
+
+// ----------------------------------------------------------------------------
+// TRADE LINES (entry / stop / trail / suggested-TP while a trade is being
+// tracked - the TP line is informational only, the real exit is the
+// trailing stop above, so price crossing it will NOT close the trade)
+// ----------------------------------------------------------------------------
+var line entryLine = na
+var line stopLine  = na
+var line tpLine    = na
+
+if showTradeLines
+    if active and na(entryLine)
+        entryLine := line.new(entryBar, entryPrice, bar_index, entryPrice, color = color.white, style = line.style_dotted)
+        stopLine  := line.new(entryBar, stopPrice, bar_index, stopPrice, color = color.red, style = line.style_dotted)
+        tpLine    := line.new(entryBar, suggestedTp, bar_index, suggestedTp, color = color.green, style = line.style_dashed)
+    else if active and not na(entryLine)
+        line.set_xy2(entryLine, bar_index, entryPrice)
+        line.set_xy2(stopLine, bar_index, stopPrice)
+        line.set_y1(stopLine, stopPrice)
+        line.set_xy2(tpLine, bar_index, suggestedTp)
+    else if not active and not na(entryLine)
+        line.delete(entryLine)
+        line.delete(stopLine)
+        line.delete(tpLine)
+        entryLine := na
+        stopLine  := na
+        tpLine    := na
+
+// ----------------------------------------------------------------------------
+// EXIT MARKER (fires the bar a trade actually closes, so you can see
+// whether it played out as a win or a loss and by how much)
+// ----------------------------------------------------------------------------
+if tradeClosed
+    label.new(bar_index, closeR > 0 ? high + atr1m : low - atr1m, closeText,
+         style = closeR > 0 ? label.style_label_down : label.style_label_up,
+         color = color.new(closeR > 0 ? color.green : color.red, 0), textcolor = color.white, size = size.small)
+
+// ----------------------------------------------------------------------------
+// ENTRY LABEL
+// ----------------------------------------------------------------------------
+if longTrig or shortTrig
+    dirColor    = longTrig ? bullColor : bearColor
+    labelAnchor = longTrig ? low - atr1m * 0.75 : high + atr1m * 0.75
+    labelStyle  = longTrig ? label.style_label_up : label.style_label_down
+    dirTxt      = longTrig ? "🟢 CRT LONG" : "🔴 CRT SHORT"
+    txt = dirTxt + "\n📍 Entry " + str.tostring(entryPrice, format.mintick) + "\n🛑 Stop " + str.tostring(stopPrice, format.mintick) + "\n🎯 TP(" + str.tostring(suggestedTpR, "#.0") + "R) " + str.tostring(suggestedTp, format.mintick)
+    label.new(bar_index, labelAnchor, txt, style = labelStyle, color = color.new(dirColor, 0), textcolor = color.white, size = size.normal)
+
+// ----------------------------------------------------------------------------
+// DASHBOARD
+// ----------------------------------------------------------------------------
+if showStatsTable and barstate.islast
+    var table dash = table.new(position.top_right, 2, 5, border_width = 1, border_color = #000000, frame_width = 1, frame_color = #000000, bgcolor = #131722)
+    stateText = not chartIsOneMin ? "⛔ Not a 1min chart" : active ? "💰 Trade Active" : curDir == 1 ? "🟢 Bias: Long" : curDir == -1 ? "🔴 Bias: Short" : pendDir != 0 ? "🔎 Candidate pending" : "🔍 Searching"
+    bgSolid = #131722
+
+    table.cell(dash, 0, 0, "CRT v22", text_color = color.white, bgcolor = #1e2a3a, text_size = size.tiny)
+    table.cell(dash, 1, 0, syminfo.ticker, text_color = color.white, bgcolor = #1e2a3a, text_size = size.tiny)
+
+    table.cell(dash, 0, 1, "1H/4H EMA", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 1, f_biasText(emaAgreeDir), text_color = f_biasColor(emaAgreeDir), bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 2, "CRT Bias", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 2, f_biasText(curDir), text_color = f_biasColor(curDir), bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 3, "Status", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 3, stateText, text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 4, "Record", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 4, str.tostring(wins) + "W " + str.tostring(losses) + "L (" + (not na(winrate) ? str.tostring(winrate, "#.0") + "%" : "N/A") + ")", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+
+// ----------------------------------------------------------------------------
+// ALERTS
+// ----------------------------------------------------------------------------
+alertcondition(longTrig, title = "CRT Bias Long Entry", message = "CRT bias LONG entry — check chart for stop")
+alertcondition(shortTrig, title = "CRT Bias Short Entry", message = "CRT bias SHORT entry — check chart for stop")

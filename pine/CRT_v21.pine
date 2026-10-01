@@ -1,0 +1,401 @@
+//@version=6
+indicator("CRT v21 - A+ Setup Finder", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ============================================================================
+// CRT v21 - A+ SETUP FINDER
+// ============================================================================
+// CRT stays the primary confluence - it's Step 1, the anchor everything else
+// confirms. This is the exact 3-candle definition it's built from:
+//   Candle 1 - a large-bodied directional candle. Defines the range.
+//   Candle 2 - a SMALL-bodied candle. One wick sweeps beyond C1's high or
+//              low (grabs C1's liquidity) and closes back inside C1's range.
+//   Candle 3 - the reaction/entry candle. It sweeps C2's OPPOSITE (small,
+//              untouched) wick - a second, smaller liquidity pocket - and
+//              closes aggressively through it in the trade direction. That
+//              aggressive displacement should leave behind a Fair Value Gap
+//              (the classic 3-candle imbalance: C2, C3, and the candle right
+//              after C3). THAT gap is the actual entry zone.
+// Pipeline:
+// No scoring/points anywhere - every stage is a hard yes/no gate, same as
+// the companion ICT script. A setup either clears every gate and fires, or
+// it doesn't and the attempt dies. Nothing "buys back" a failed gate.
+//   Stage 1 (SEARCH -> ARMED): C1 + C2 form (pattern rules below), HTF bias
+//            aligns (4H dominant, 1H fallback, both lagged to the last
+//            closed bar so bias can't repaint intrabar) -> ARMED.
+//   Stage 2 (ARMED -> reaction found): wait, within the reaction window, for
+//            a candle (C3) that closes beyond C2's OPPOSITE wick extreme -
+//            sweeping that minor liquidity pocket and displacing hard.
+//   Stage 2b (CHECK_FVG): exactly one bar after C3, check whether it left a
+//            valid FVG behind. No gap -> no PD array -> the attempt is dead,
+//            back to searching. This is deliberately strict: fewer, more
+//            trustworthy entries over more, weaker ones.
+//   Stage 3 (AWAIT_ENTRY -> ENTRY): wait for a retracement back into that
+//            FVG, within the entry window. First touch -> fires immediately.
+//
+// HOW TO GET PHONE ALERTS:
+//   1. Add this indicator to your chart.
+//   2. Right-click chart -> Add Alert.
+//   3. Condition = this indicator, choose "CRT A+ Long Setup" or
+//      "CRT A+ Short Setup".
+//   4. Trigger = "Once Per Bar Close".
+//   5. Under Notifications, check "App notification".
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// INPUTS
+// ----------------------------------------------------------------------------
+grpStruct = "Structure / Bias"
+emaLen = input.int(50, "HTF EMA Length", group = grpStruct)
+atrLen = input.int(14, "ATR Length", group = grpStruct)
+
+grpPattern = "CRT Pattern"
+c1MinAtrMult   = input.float(0.8, "Min C1 range (x ATR)", minval = 0, group = grpPattern)
+c1MinBodyRatio = input.float(0.6, "Min C1 body:range ratio", minval = 0, maxval = 1, group = grpPattern)
+c2MaxBodyRatio = input.float(0.5, "Max C2 body:range ratio (small-body sweep candle)", minval = 0, maxval = 1, group = grpPattern)
+minFvgAtr      = input.float(0.15, "Min FVG size left by Candle 3 (x ATR)", minval = 0, group = grpPattern)
+
+grpTiming = "Timing (minutes, auto-converted to bars)"
+reactionWindowMin = input.int(90, "C2 -> Candle 3 reaction window", minval = 1, group = grpTiming)
+entryWindowMin    = input.int(60, "FVG confirmed -> retracement entry window", minval = 1, group = grpTiming)
+
+grpTrade        = "Trade Simulation"
+stopBufferAtr   = input.float(0.15, "Stop buffer beyond the FVG (x ATR)", minval = 0, group = grpTrade)
+targetRMultiple = input.float(2.0, "Target (R multiple)", minval = 0.1, group = grpTrade)
+maxTradeBars    = input.int(20, "Max bars to resolve trade before timeout", minval = 1, group = grpTrade)
+
+grpVis          = "Visuals"
+showRawPatterns = input.bool(true, "Show raw CRT pattern boxes (dim)", group = grpVis)
+showTradeLines  = input.bool(true, "Show entry/stop/target lines", group = grpVis)
+showStatsTable  = input.bool(true, "Show status table", group = grpVis)
+bullColor       = input.color(color.new(color.teal, 0), "Bullish color", group = grpVis)
+bearColor       = input.color(color.new(color.red, 0), "Bearish color", group = grpVis)
+
+grpTF        = "Timeframe Filter (disables detection outside this range)"
+tfMinMinutes = input.int(15, "Min chart TF (minutes)", minval = 1, group = grpTF)
+tfMaxMinutes = input.int(60, "Max chart TF (minutes)", minval = 1, group = grpTF)
+
+// ----------------------------------------------------------------------------
+// TYPES
+// ----------------------------------------------------------------------------
+type CrtSetup
+    string dir
+    float  c1High
+    float  c1Low
+    float  c2High
+    float  c2Low
+    float  c2Open
+    float  c2Close
+    int    armedBar
+    int    reactionBar = na
+    float  fvgTop       = na
+    float  fvgBottom    = na
+
+// ----------------------------------------------------------------------------
+// PERSISTENT STATE
+// ----------------------------------------------------------------------------
+var int ST_SEARCH      = 0
+var int ST_ARMED       = 1
+var int ST_CHECK_FVG   = 2
+var int ST_AWAIT_ENTRY = 3
+
+var int      fsmState  = ST_SEARCH
+var CrtSetup activeCrt = na
+
+var float entryPrice  = na
+var float stopPrice   = na
+var float targetPrice = na
+var int   entryBar    = na
+var bool  active       = false
+var bool  isBull       = false
+
+var int wins             = 0
+var int losses           = 0
+var int timeouts         = 0
+var int skippedBusy      = 0
+var int armedCount       = 0
+var int reactedCount     = 0
+var int fvgConfirmedCount = 0
+var int trades           = 0
+
+var box  activeBox  = na
+var box  zoneBox    = na
+var line entryLine  = na
+var line stopLine   = na
+var line targetLine = na
+
+// ----------------------------------------------------------------------------
+// CANDLES (C1 = 2 bars back, C2 = 1 bar back)
+// ----------------------------------------------------------------------------
+c1_high  = high[2]
+c1_low   = low[2]
+c1_open  = open[2]
+c1_close = close[2]
+
+c2_high  = high[1]
+c2_low   = low[1]
+c2_open  = open[1]
+c2_close = close[1]
+
+atr         = ta.atr(atrLen)
+offsetPrice = atr * 0.3
+
+// ----------------------------------------------------------------------------
+// RAW CRT PATTERN DETECTION (Candle 1 + Candle 2 only - Candle 3 is a
+// separate, later confirmation stage, not part of "is this a CRT")
+// ----------------------------------------------------------------------------
+doubleSweep = (c2_high > c1_high) and (c2_low < c1_low)
+
+c1_range = c1_high - c1_low
+c1_body  = math.abs(c1_close - c1_open)
+c1_ratio = c1_range != 0 ? c1_body / c1_range : 0.0
+c1_valid = c1_range > atr * c1MinAtrMult and c1_ratio > c1MinBodyRatio
+
+bearSweep = c2_high > c1_high and c2_close < c1_high
+bullSweep = c2_low  < c1_low  and c2_close > c1_low
+
+c2_range = c2_high - c2_low
+c2_body  = math.abs(c2_close - c2_open)
+c2_ratio = c2_range != 0 ? c2_body / c2_range : 0.0
+c2_smallBody = c2_ratio <= c2MaxBodyRatio
+
+bearCRT = c1_valid and bearSweep and c2_smallBody and not doubleSweep
+bullCRT = c1_valid and bullSweep and c2_smallBody and not doubleSweep
+
+// ----------------------------------------------------------------------------
+// HTF BIAS - 4H dominant, 1H fallback, both lagged to the last CLOSED bar
+// so bias can never repaint intrabar (backtests only ever see closed HTF
+// data, so live has to match or the two diverge).
+// ----------------------------------------------------------------------------
+htf1Close = request.security(syminfo.tickerid, "60", close[1], lookahead = barmerge.lookahead_off)
+htf1Ema   = request.security(syminfo.tickerid, "60", ta.ema(close, emaLen)[1], lookahead = barmerge.lookahead_off)
+htf4Close = request.security(syminfo.tickerid, "240", close[1], lookahead = barmerge.lookahead_off)
+htf4Ema   = request.security(syminfo.tickerid, "240", ta.ema(close, emaLen)[1], lookahead = barmerge.lookahead_off)
+
+bias1H = htf1Close > htf1Ema ? 1 : htf1Close < htf1Ema ? -1 : 0
+bias4H = htf4Close > htf4Ema ? 1 : htf4Close < htf4Ema ? -1 : 0
+finalBias = bias4H != 0 ? bias4H : bias1H
+
+bullBiasOk = finalBias == 1
+bearBiasOk = finalBias == -1
+
+f_biasText(b) =>
+    b == 1 ? "🟢 Bullish" : b == -1 ? "🔴 Bearish" : "⚪ Neutral"
+
+f_biasColor(b) =>
+    b == 1 ? color.new(color.lime, 0) : b == -1 ? color.new(color.red, 0) : color.new(color.gray, 0)
+
+// ----------------------------------------------------------------------------
+// TIMING: minutes -> bars for whatever TF the chart is on
+// ----------------------------------------------------------------------------
+barSeconds         = timeframe.in_seconds(timeframe.period)
+reactionWindowBars = int(math.max(1, math.round(reactionWindowMin * 60 / barSeconds)))
+entryWindowBars    = int(math.max(1, math.round(entryWindowMin * 60 / barSeconds)))
+
+// Gates the ENTIRE pipeline below, not just alerts - on a 1m/5m chart, C1/C2/C3
+// would just be noise, so detection itself is switched off outside this range,
+// not merely silenced. Widen tfMinMinutes if you want lower TFs re-enabled.
+validTF = timeframe.in_seconds() >= tfMinMinutes * 60 and timeframe.in_seconds() <= tfMaxMinutes * 60
+
+// ----------------------------------------------------------------------------
+// RAW PATTERN VISUAL (dim, informational - every C1+C2 pattern regardless of
+// whether it ever gets armed)
+// ----------------------------------------------------------------------------
+if barstate.isconfirmed and validTF
+    if showRawPatterns and (bullCRT or bearCRT)
+        rawCol = bullCRT ? bullColor : bearColor
+        box.new(bar_index[2], c1_high, bar_index[1], c1_low, border_color = color.new(rawCol, 60), bgcolor = color.new(rawCol, 92), border_width = 1)
+        if active
+            label.new(bar_index[1], bullCRT ? c2_low - offsetPrice : c2_high + offsetPrice, "⚠ busy",
+                 color = color.new(color.orange, 40), textcolor = color.white,
+                 style = bullCRT ? label.style_label_up : label.style_label_down, size = size.tiny)
+
+// ----------------------------------------------------------------------------
+// FSM (confirmed bars only -> non-repainting)
+// ----------------------------------------------------------------------------
+bool longTrig  = false
+bool shortTrig = false
+
+if barstate.isconfirmed and validTF
+    // --- Stage 1: SEARCH -> ARMED ---
+    if fsmState == ST_SEARCH
+        if not active and bullCRT and bullBiasOk
+            activeCrt := CrtSetup.new("bull", c1_high, c1_low, c2_high, c2_low, c2_open, c2_close, bar_index)
+            fsmState  := ST_ARMED
+            armedCount += 1
+        else if not active and bearCRT and bearBiasOk
+            activeCrt := CrtSetup.new("bear", c1_high, c1_low, c2_high, c2_low, c2_open, c2_close, bar_index)
+            fsmState  := ST_ARMED
+            armedCount += 1
+        else if active and (bullCRT or bearCRT)
+            skippedBusy += 1
+
+    // --- Bias flip safety reset ---
+    if fsmState != ST_SEARCH and not na(activeCrt)
+        biasStillOk = activeCrt.dir == "bull" ? bullBiasOk : bearBiasOk
+        if not biasStillOk
+            fsmState  := ST_SEARCH
+            activeCrt := na
+
+    // --- Stage 2: ARMED -> Candle 3 found (sweeps C2's opposite wick and
+    //     closes aggressively through it) ---
+    if fsmState == ST_ARMED and not na(activeCrt)
+        isBullDir = activeCrt.dir == "bull"
+        reacted = isBullDir ? close > activeCrt.c2High : close < activeCrt.c2Low
+        if reacted
+            activeCrt.reactionBar := bar_index
+            fsmState := ST_CHECK_FVG
+            reactedCount += 1
+        else if bar_index - activeCrt.armedBar > reactionWindowBars
+            fsmState  := ST_SEARCH
+            activeCrt := na
+
+    // --- Stage 2b: exactly one bar after Candle 3 - did it leave an FVG? ---
+    if fsmState == ST_CHECK_FVG and not na(activeCrt) and bar_index == activeCrt.reactionBar + 1
+        isBullDir = activeCrt.dir == "bull"
+        gapSize = isBullDir ? (low - activeCrt.c2High) : (activeCrt.c2Low - high)
+        if gapSize >= atr * minFvgAtr
+            activeCrt.fvgTop    := isBullDir ? low : activeCrt.c2Low
+            activeCrt.fvgBottom := isBullDir ? activeCrt.c2High : high
+            fsmState := ST_AWAIT_ENTRY
+            fvgConfirmedCount += 1
+        else
+            // No imbalance left behind -> no PD array -> this attempt is
+            // dead. Deliberately strict: fewer, more trustworthy entries.
+            fsmState  := ST_SEARCH
+            activeCrt := na
+
+    // --- Stage 3: AWAIT_ENTRY -> ENTRY (retracement into the FVG fires
+    //     immediately - no score gate, first touch is the trigger) ---
+    // Guarded to bars AFTER the FVG-confirming bar: without this, this block
+    // runs in the SAME bar-pass as Stage 2b just above, using that same
+    // bar's own high/low both to define the gap AND to "retest" it - which
+    // is always trivially true (the current bar's high/low always overlaps
+    // a gap boundary it just set). That made entries fire immediately after
+    // Candle 3 every time, with no real retracement ever required.
+    if fsmState == ST_AWAIT_ENTRY and not na(activeCrt) and bar_index > activeCrt.reactionBar + 1
+        isBullDir = activeCrt.dir == "bull"
+        retest = low <= activeCrt.fvgTop and high >= activeCrt.fvgBottom
+        if retest
+            entryPrice  := isBullDir ? activeCrt.fvgTop : activeCrt.fvgBottom
+            stopPrice   := isBullDir ? activeCrt.fvgBottom - atr * stopBufferAtr : activeCrt.fvgTop + atr * stopBufferAtr
+            targetPrice := isBullDir ? entryPrice + (entryPrice - stopPrice) * targetRMultiple : entryPrice - (stopPrice - entryPrice) * targetRMultiple
+            entryBar    := bar_index
+            active      := true
+            isBull      := isBullDir
+            trades      += 1
+            longTrig  := isBullDir
+            shortTrig := not isBullDir
+            fsmState  := ST_SEARCH
+            activeCrt := na
+        else if bar_index - activeCrt.reactionBar > entryWindowBars
+            fsmState  := ST_SEARCH
+            activeCrt := na
+
+    // --- Trade resolution (independent of FSM once a trade is live) ---
+    if active
+        inTradeWindow = bar_index >= entryBar and bar_index <= entryBar + maxTradeBars
+        hitStop   = inTradeWindow and (isBull ? low <= stopPrice : high >= stopPrice)
+        hitTarget = inTradeWindow and (isBull ? high >= targetPrice : low <= targetPrice)
+        tradeWin     = hitTarget and not hitStop
+        tradeLoss    = hitStop
+        tradeTimeout = bar_index == entryBar + maxTradeBars and not hitStop and not hitTarget
+        if tradeWin
+            wins   += 1
+            active := false
+        else if tradeLoss
+            losses += 1
+            active := false
+        else if tradeTimeout
+            timeouts += 1
+            active   := false
+
+resolvedTrades = wins + losses
+winrate = resolvedTrades > 0 ? wins * 100.0 / resolvedTrades : na
+
+// ----------------------------------------------------------------------------
+// ACTIVE SETUP / FVG VISUALS (extend live so boxes track price smoothly
+// instead of only jumping on confirmed bars)
+// ----------------------------------------------------------------------------
+if not na(activeCrt)
+    activeCol = activeCrt.dir == "bull" ? bullColor : bearColor
+    if na(activeBox)
+        activeBox := box.new(activeCrt.armedBar, activeCrt.c1High, bar_index, activeCrt.c1Low, border_color = activeCol, bgcolor = color.new(activeCol, 80))
+    else
+        box.set_right(activeBox, bar_index)
+        box.set_top(activeBox, activeCrt.c1High)
+        box.set_bottom(activeBox, activeCrt.c1Low)
+else if not na(activeBox)
+    box.delete(activeBox)
+    activeBox := na
+
+if not na(activeCrt) and fsmState == ST_AWAIT_ENTRY
+    zoneCol = activeCrt.dir == "bull" ? bullColor : bearColor
+    if na(zoneBox)
+        zoneBox := box.new(activeCrt.reactionBar, activeCrt.fvgTop, bar_index, activeCrt.fvgBottom, border_color = zoneCol, bgcolor = color.new(zoneCol, 65))
+    else
+        box.set_right(zoneBox, bar_index)
+else if not na(zoneBox)
+    box.delete(zoneBox)
+    zoneBox := na
+
+// ----------------------------------------------------------------------------
+// TRADE LINES (entry / stop / target while a trade is being tracked)
+// ----------------------------------------------------------------------------
+if showTradeLines
+    if active and na(entryLine)
+        entryLine  := line.new(entryBar, entryPrice, bar_index, entryPrice, color = color.white, style = line.style_dotted)
+        stopLine   := line.new(entryBar, stopPrice, bar_index, stopPrice, color = color.red, style = line.style_dotted)
+        targetLine := line.new(entryBar, targetPrice, bar_index, targetPrice, color = color.green, style = line.style_dotted)
+    else if active and not na(entryLine)
+        line.set_xy2(entryLine, bar_index, entryPrice)
+        line.set_xy2(stopLine, bar_index, stopPrice)
+        line.set_xy2(targetLine, bar_index, targetPrice)
+    else if not active and not na(entryLine)
+        line.delete(entryLine)
+        line.delete(stopLine)
+        line.delete(targetLine)
+        entryLine  := na
+        stopLine   := na
+        targetLine := na
+
+// ----------------------------------------------------------------------------
+// A+ ENTRY LABEL (only real, confirmed entries - not every raw pattern)
+// ----------------------------------------------------------------------------
+if longTrig or shortTrig
+    dirColor    = longTrig ? bullColor : bearColor
+    labelAnchor = longTrig ? low - atr * 0.75 : high + atr * 0.75
+    labelStyle  = longTrig ? label.style_label_up : label.style_label_down
+    dirTxt      = longTrig ? "🟢 A+ CRT LONG" : "🔴 A+ CRT SHORT"
+    txt = dirTxt + "\n📍 Entry " + str.tostring(entryPrice, format.mintick)
+    label.new(bar_index, labelAnchor, txt, style = labelStyle, color = color.new(dirColor, 0), textcolor = color.white, size = size.normal)
+
+// ----------------------------------------------------------------------------
+// DASHBOARD
+// ----------------------------------------------------------------------------
+// Trimmed to what you'd actually glance at mid-session: bias, state, and
+// win/loss record. Armed/Reacted/FVG-confirmed/Skipped/Timeouts are still
+// tracked internally (see the counters above) in case we want them back
+// later - just not cluttering the chart.
+if showStatsTable and barstate.islast
+    var table dash = table.new(position.top_right, 2, 4, border_width = 1, border_color = #000000, frame_width = 1, frame_color = #000000, bgcolor = #131722)
+    stateText = not validTF ? "⛔ TF disabled" : active ? "💰 Trade Active" : fsmState == ST_SEARCH ? "🔍 Searching" : fsmState == ST_ARMED ? "📦 Armed" : fsmState == ST_CHECK_FVG ? "🔎 Checking FVG" : "⚡ Awaiting entry"
+    bgSolid = #131722
+
+    table.cell(dash, 0, 0, "CRT v21", text_color = color.white, bgcolor = #1e2a3a, text_size = size.tiny)
+    table.cell(dash, 1, 0, syminfo.ticker, text_color = color.white, bgcolor = #1e2a3a, text_size = size.tiny)
+
+    table.cell(dash, 0, 1, "Bias", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 1, f_biasText(finalBias), text_color = f_biasColor(finalBias), bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 2, "Status", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 2, stateText, text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 3, "Record", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 3, str.tostring(wins) + "W " + str.tostring(losses) + "L (" + (not na(winrate) ? str.tostring(winrate, "#.0") + "%" : "N/A") + ")", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+
+// ----------------------------------------------------------------------------
+// ALERTS (longTrig/shortTrig can only be true when validTF already held, so
+// no extra gating needed here)
+// ----------------------------------------------------------------------------
+alertcondition(longTrig, title = "CRT A+ Long Setup", message = "CRT A+ LONG — check chart for entry/stop/target")
+alertcondition(shortTrig, title = "CRT A+ Short Setup", message = "CRT A+ SHORT — check chart for entry/stop/target")

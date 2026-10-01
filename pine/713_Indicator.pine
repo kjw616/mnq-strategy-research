@@ -1,0 +1,543 @@
+//@version=6
+indicator("713 Indicator", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+// ============================================================================
+// 713 INDICATOR
+// ============================================================================
+// Sibling to Keen's Indicator v2.1 (Keens_Indicator_v2.1.pine) - same session-
+// sweep anchor, but a different retest mechanism: v2.1 inverts the approach-
+// leg FVG (the gap that formed on the way INTO the sweep) and retests THAT
+// same gap. This one discards the approach-leg FVG once it's done its job of
+// confirming the reversal, and instead waits for a genuinely FRESH FVG to
+// form in the new (post-reversal) direction, then retests that one instead -
+// a real, conventional "gap left behind by the confirming move" retest, not
+// a repurposed one. Combined with a tighter stop and a 1:1 target, this pays
+// out far more often (high win rate) at the cost of a smaller win each time.
+// Built for the 1-minute and 5-minute chart, same as v2.1.
+//
+// Backtest history (see src/liquidity_fvg_strategy.py, use_normal_fvg_retest=
+// true), 2023-01 through 2026-07 MNQ 1m, tick-verified against Databento
+// trade-level price data:
+//   CURRENT DEFAULT (slShrinkFactor=0.4, fixedRTarget=1.0): 1,391 trades,
+//   79.4% win rate, PF 3.86, total R 819, max drawdown 4R - combined across
+//   2023-01 through 2026-07. Checked independently, year by year:
+//     2023  85.6% win rate, PF 5.96, 397 trades, max DD 2R
+//     2024  80.8% win rate, PF 4.22, 386 trades, max DD 4R
+//     2025  75.0% win rate, PF 3.00, 388 trades, max DD 4R
+//     2026  73.6% win rate, PF 2.79, 220 trades (partial year), max DD 4R
+//   43 of 43 months profitable, zero losing months anywhere in 3.6 years.
+//   Net of realistic commission+slippage ($0.74/contract round-trip + 1 tick
+//   adverse slippage per side): $ profit factor 2.28 - still strong after
+//   real trading costs, not just on paper.
+//
+//   KNOWN OPEN RISK, read before trusting this: profit factor is declining
+//   year over year (5.96 -> 4.22 -> 3.00 -> 2.79) even after tick
+//   verification - every year is still solidly profitable, but the trend is
+//   real and its cause isn't confirmed. Leading hypothesis: this retest style
+//   requires waiting for a genuinely clean continuation FVG to form, and that
+//   specific piece may be getting crowded out or less reliable over time
+//   (possible causes: rising popularity of liquidity-sweep/FVG concepts in
+//   retail trading, or 2023's unusually clean directional conditions not
+//   repeating) - v2.1's inverse-FVG retest, which doesn't wait for a fresh
+//   continuation leg, shows NO such decay over the same 4 years, which is
+//   why that one is the more conservative "champion" and this one is the
+//   higher-win-rate alternative, not a strict upgrade.
+//
+//   The tight shrink factor (0.4, tighter than v2.1's 0.7) means MORE
+//   contracts per trade under fixed-dollar-risk sizing, and a small risk
+//   unit is more sensitive in percentage terms to real-world slippage than
+//   a wider one - the net-of-costs number above uses the same flat 1-tick
+//   assumption as everywhere else and may be optimistic for this specific
+//   config. Watch live fills against this before trusting it fully.
+//
+//   Entry/SL/TP are rounded to the instrument's tick size before use
+//   (math.round_to_mintick). Position sizing: cap your own size in practice
+//   (see src/bot/sizing.py's max_contracts) rather than blindly scaling to a
+//   fixed dollar risk target every trade - the same open risk v2.1 has.
+// ============================================================================
+
+grpGeneral    = "General"
+sessTz        = input.string("America/New_York", "Session Timezone", group = grpGeneral)
+asiaSession   = input.session("1800-0000", "Asia Session Time", group = grpGeneral)
+londonSession = input.session("0200-0500", "London Session Time", group = grpGeneral)
+atrLen        = input.int(14, "ATR Length (label offset only)", group = grpGeneral)
+
+grpTarget      = "Target"
+fixedRTarget    = input.float(1.0, "Fixed R Target", step = 0.5, group = grpTarget)
+slShrinkFactor  = input.float(0.4, "SL/TP Shrink Factor (1.0 = full swept-level distance)", step = 0.1, minval = 0.05, maxval = 1.0, group = grpTarget)
+maxBarsAwaitingFreshFvg = input.int(500, "Max bars waiting for a fresh FVG to form (0 = no cap)", group = grpTarget)
+
+grpFilt        = "Filters"
+useTimeFilter  = input.bool(false, "Only trade NY AM hours", group = grpFilt)
+tradingStartHr = input.int(7, "Trading Window Start Hour (NY, inclusive)", group = grpFilt)
+tradingEndHr   = input.int(10, "Trading Window End Hour (NY, inclusive)", group = grpFilt)
+
+grpAlerts       = "Alerts"
+alertCooldownBars = input.int(15, "Min bars between 'armed' pings (notification-only, does not affect trading)", group = grpAlerts)
+
+grpVis         = "Visuals"
+showStatsTable = input.bool(true, "Show stats table", group = grpVis)
+debugTable     = input.bool(false, "Show debug table (verification only)", group = grpVis)
+showFvgBox     = input.bool(true, "Show tracked FVG box", group = grpVis)
+
+atrVal = ta.atr(atrLen)
+
+// ----------------------------------------------------------------------------
+// Session high/low tracker - identical to v2.1.
+// ----------------------------------------------------------------------------
+f_sessionLevels(sessString, tz) =>
+    var float sHigh   = na
+    var float sLow    = na
+    var bool  active  = false
+    var bool  hSwept  = false
+    var bool  lSwept  = false
+
+    t    = time(timeframe.period, sessString, tz)
+    isIn = not na(t)
+
+    justHighSwept = false
+    justLowSwept  = false
+
+    if isIn and not active
+        sHigh  := high
+        sLow   := low
+        active := true
+    else if isIn and active
+        sHigh := math.max(sHigh, high)
+        sLow  := math.min(sLow, low)
+    else if not isIn and active
+        active := false
+        hSwept := false
+        lSwept := false
+
+    if not active and not na(sHigh)
+        if not hSwept and high > sHigh
+            hSwept := true
+            justHighSwept := true
+        if not lSwept and low < sLow
+            lSwept := true
+            justLowSwept := true
+
+    [sHigh, sLow, hSwept, lSwept, justHighSwept, justLowSwept]
+
+[asiaHigh, asiaLow, asiaHighSwept, asiaLowSwept, asiaHighJustSwept, asiaLowJustSwept] = f_sessionLevels(asiaSession, sessTz)
+[londonHigh, londonLow, londonHighSwept, londonLowSwept, londonHighJustSwept, londonLowJustSwept] = f_sessionLevels(londonSession, sessTz)
+
+var float midnightOpen = na
+nyHour        = hour(time, sessTz)
+isMidnightBar = nyHour == 0 and (na(nyHour[1]) or nyHour[1] != 0)
+if isMidnightBar
+    midnightOpen := open
+
+// ----------------------------------------------------------------------------
+// FVG tracking - a rolling pool of untapped gaps, used to find the APPROACH-
+// LEG FVG that confirms the reversal. The FRESH FVG that becomes the actual
+// retest zone is found separately below, once confirmed - it isn't drawn
+// from this pool (it has to form AFTER confirmation, in the new direction).
+// ----------------------------------------------------------------------------
+type FVG
+    float top
+    float bottom
+    int   barIndex
+
+var array<FVG> pendingBull = array.new<FVG>()
+var array<FVG> pendingBear = array.new<FVG>()
+
+isBullFVG = high[2] < low
+isBearFVG = low[2] > high
+
+if isBullFVG
+    array.push(pendingBull, FVG.new(low, high[2], bar_index))
+if isBearFVG
+    array.push(pendingBear, FVG.new(low[2], high, bar_index))
+
+if array.size(pendingBull) > 0
+    for i = array.size(pendingBull) - 1 to 0
+        f = array.get(pendingBull, i)
+        if close < f.bottom
+            array.remove(pendingBull, i)
+
+if array.size(pendingBear) > 0
+    for i = array.size(pendingBear) - 1 to 0
+        f = array.get(pendingBear, i)
+        if close > f.top
+            array.remove(pendingBear, i)
+
+// ----------------------------------------------------------------------------
+// Setup + trade state
+// ----------------------------------------------------------------------------
+var string setupDir          = na     // "long" or "short"
+var FVG    setupFVG          = na     // approach-leg FVG - only alive through confirmation
+var FVG    entryFvg          = na     // the FRESH FVG actually used as the retest zone
+var FVG    stagedEntryFvg    = na     // staged one bar - see comment at use below
+var float  setupSL           = na
+var float  setupEntry        = na
+var float  setupTP           = na
+var float  stagedSetupEntry  = na
+var float  stagedSetupTP     = na
+var bool   awaitingConfirm   = false
+var bool   awaitingFreshFvg  = false
+var bool   awaitingRetest    = false
+var int    setupAnchorBar    = na
+var int    confirmedBar      = na     // bar the reversal confirmed - anchors the fresh-FVG wait
+var int    setupConfirmBar   = na     // bar the fresh FVG was found - anchors the retest wait
+
+var bool  tradeActive   = false
+var bool  tradeIsLong   = false
+var float tradeEntry    = na
+var float tradeSL       = na
+var float tradeTP       = na
+var int   tradeEntryBar = na
+
+var int wins   = 0
+var int losses = 0
+var int skippedNoTarget      = 0
+var int skippedNoFreshFvg    = 0
+var int skippedBadGeometry   = 0
+
+f_passesFilters(entryPrice, slPrice, tpPrice) =>
+    timeOk = not useTimeFilter or (nyHour >= tradingStartHr and nyHour <= tradingEndHr)
+    timeOk
+
+// Bug guard (ported from the Python backtest, src/liquidity_fvg_strategy.py):
+// resolve_target's shrink/target math assumes entryCandidate is still on the
+// correct side of setupSL. If price has drifted back through setupSL while
+// waiting for a fresh FVG (no fixed time limit by default), SL and TP can
+// end up on the wrong side of entry - even colliding exactly - instead of
+// straddling it properly. Reject anything that doesn't have the sane
+// long/short shape rather than trade it.
+f_geometryOk(dir, entryPrice, slPrice, tpPrice) =>
+    na(entryPrice) or na(slPrice) or na(tpPrice) ? false : (dir == "long" ? slPrice < entryPrice and entryPrice < tpPrice : tpPrice < entryPrice and entryPrice < slPrice)
+
+f_resolveTarget(dir, fvg) =>
+    entryCandidate = math.round_to_mintick((fvg.top + fvg.bottom) / 2)
+    effectiveSL = dir == "long" ? math.round_to_mintick(entryCandidate - slShrinkFactor * (entryCandidate - setupSL)) : math.round_to_mintick(entryCandidate + slShrinkFactor * (setupSL - entryCandidate))
+    tpRisk = math.abs(entryCandidate - effectiveSL)
+    tp = dir == "long" ? math.round_to_mintick(entryCandidate + fixedRTarget * tpRisk) : math.round_to_mintick(entryCandidate - fixedRTarget * tpRisk)
+    [entryCandidate, effectiveSL, tp]
+
+lowSweptNow    = asiaLowJustSwept or londonLowJustSwept
+highSweptNow   = asiaHighJustSwept or londonHighJustSwept
+sweptLowLevel  = asiaLowJustSwept ? asiaLow : londonLow
+sweptHighLevel = asiaHighJustSwept ? asiaHigh : londonHigh
+
+// ----------------------------------------------------------------------------
+// Staged fresh FVG becomes the live retest zone - staged rather than applied
+// directly, since a fresh gap's own top edge is literally this bar's own
+// low/high, so checking "is price back in the zone" on the SAME bar it
+// formed would trivially always be true. Staging delays it by exactly one
+// bar so the retest check only ever sees a past-bar level.
+// ----------------------------------------------------------------------------
+if not na(stagedEntryFvg)
+    entryFvg   := stagedEntryFvg
+    setupEntry := stagedSetupEntry
+    setupTP    := stagedSetupTP
+    awaitingRetest  := true
+    setupConfirmBar := bar_index
+    stagedEntryFvg := na
+
+// anchor a new long setup off a fresh low sweep (only when fully flat)
+if lowSweptNow and not awaitingConfirm and not awaitingFreshFvg and not awaitingRetest and not tradeActive and array.size(pendingBear) > 0
+    setupFVG := array.get(pendingBear, array.size(pendingBear) - 1)
+    array.remove(pendingBear, array.size(pendingBear) - 1)
+    setupDir        := "long"
+    setupSL         := sweptLowLevel
+    awaitingConfirm := true
+    setupAnchorBar  := bar_index
+
+// anchor a new short setup off a fresh high sweep (only when fully flat)
+if highSweptNow and not awaitingConfirm and not awaitingFreshFvg and not awaitingRetest and not tradeActive and array.size(pendingBull) > 0
+    setupFVG := array.get(pendingBull, array.size(pendingBull) - 1)
+    array.remove(pendingBull, array.size(pendingBull) - 1)
+    setupDir        := "short"
+    setupSL         := sweptHighLevel
+    awaitingConfirm := true
+    setupAnchorBar  := bar_index
+
+// a sweep on the opposite side before we confirm/retest invalidates the
+// thesis. justInvalidated only fires if a limit order was actually armed
+// (awaitingRetest) - that's the case where you have a real resting order to
+// go cancel; awaitingFreshFvg cancellations never had an order placed yet.
+var bool justInvalidated = false
+justInvalidated := false
+
+if awaitingConfirm or awaitingFreshFvg or awaitingRetest
+    if setupDir == "long" and highSweptNow
+        if awaitingRetest
+            justInvalidated := true
+        awaitingConfirm  := false
+        awaitingFreshFvg := false
+        awaitingRetest   := false
+        setupFVG := na
+        entryFvg := na
+    else if setupDir == "short" and lowSweptNow
+        if awaitingRetest
+            justInvalidated := true
+        awaitingConfirm  := false
+        awaitingFreshFvg := false
+        awaitingRetest   := false
+        setupFVG := na
+        entryFvg := na
+
+// price reclaiming back through the ORIGINAL swept level while waiting for a
+// fresh FVG also invalidates the thesis - see f_geometryOk's comment above
+// for why this matters. This is a generic "has price closed back past the
+// level" check, not tied to a new session sweep, so it catches drift the
+// sweep-based check above can't.
+if awaitingFreshFvg
+    reclaimBroken = setupDir == "long" ? close < setupSL : close > setupSL
+    if reclaimBroken
+        skippedNoFreshFvg += 1
+        awaitingFreshFvg := false
+        setupFVG := na
+    else if maxBarsAwaitingFreshFvg > 0 and (bar_index - confirmedBar) > maxBarsAwaitingFreshFvg
+        skippedNoFreshFvg += 1
+        awaitingFreshFvg := false
+        setupFVG := na
+
+// reversal confirmation: close through the approach-leg FVG. Unlike v2.1,
+// this does NOT compute SL/TP from setupFVG directly - it discards setupFVG
+// once it's done its job of confirming the reversal, and instead starts
+// waiting for a genuinely fresh FVG in the new direction (below).
+var bool justArmed = false
+justArmed := false
+
+// gated on barstate.isconfirmed - see v2.1 for the full reasoning (a
+// provisional mid-bar cross that reverses before close shouldn't count).
+if awaitingConfirm and not na(setupFVG) and barstate.isconfirmed
+    if setupDir == "long" and close > setupFVG.top
+        awaitingConfirm  := false
+        awaitingFreshFvg := true
+        confirmedBar     := bar_index
+        setupFVG := na
+    else if setupDir == "short" and close < setupFVG.bottom
+        awaitingConfirm  := false
+        awaitingFreshFvg := true
+        confirmedBar     := bar_index
+        setupFVG := na
+
+// search for the next fresh FVG in the post-reversal direction (reusing this
+// bar's own FVG check above - isBullFVG/isBearFVG already computed globally).
+// Known minor divergence from the verified Python backtest: this builds a
+// fresh FVG value directly rather than popping it out of pendingBull/
+// pendingBear, so the same gap could theoretically still be picked up later
+// as a DIFFERENT setup's approach-leg anchor. Low practical impact (a setup
+// can only anchor while fully flat, and price has almost always already
+// moved past this specific gap - pruning it from the pool - by the time
+// that could happen), but worth knowing about if the two ever diverge.
+if awaitingFreshFvg
+    FVG freshFvg = na
+    if setupDir == "long" and isBullFVG
+        freshFvg := FVG.new(low, high[2], bar_index)
+    else if setupDir == "short" and isBearFVG
+        freshFvg := FVG.new(low[2], high, bar_index)
+
+    if not na(freshFvg)
+        [entryCandidate, effectiveSL, tp] = f_resolveTarget(setupDir, freshFvg)
+        awaitingFreshFvg := false
+        if not f_geometryOk(setupDir, entryCandidate, effectiveSL, tp)
+            skippedBadGeometry += 1
+        else if not f_passesFilters(entryCandidate, effectiveSL, tp)
+            skippedNoTarget += 1
+        else
+            stagedEntryFvg   := freshFvg
+            setupSL          := effectiveSL
+            stagedSetupEntry := entryCandidate
+            stagedSetupTP    := tp
+            justArmed        := true
+
+// entry trigger: retracement back into the fresh FVG
+var bool justEntered = false
+justEntered := false
+
+if awaitingRetest and not na(entryFvg)
+    inZone = low <= entryFvg.top and high >= entryFvg.bottom
+    if inZone
+        justEntered    := true
+        awaitingRetest := false
+
+if justEntered
+    tradeActive   := true
+    tradeIsLong   := setupDir == "long"
+    tradeEntry    := setupEntry
+    tradeSL       := setupSL
+    tradeTP       := setupTP
+    tradeEntryBar := bar_index
+    entryFvg      := na
+
+    dirTxt = tradeIsLong ? "🟢 LONG" : "🔴 SHORT"
+    txt = dirTxt + "\n📍 Entry " + str.tostring(tradeEntry, format.mintick) + "\n🛑 SL " + str.tostring(tradeSL, format.mintick) + "\n🎯 TP " + str.tostring(tradeTP, format.mintick)
+    label.new(bar_index, tradeIsLong ? low - atrVal * 0.75 : high + atrVal * 0.75, txt,
+      style = tradeIsLong ? label.style_label_up : label.style_label_down,
+      color = color.new(tradeIsLong ? color.green : color.red, 0), textcolor = color.white, size = size.small)
+
+// ----------------------------------------------------------------------------
+// Trade lines while active
+// ----------------------------------------------------------------------------
+var line entryLine = na
+var line slLine    = na
+var line tpLine    = na
+var box  fvgBox    = na
+
+if justEntered
+    entryLine := line.new(tradeEntryBar, tradeEntry, bar_index, tradeEntry, color = color.white, style = line.style_dotted, width = 3, extend = extend.right)
+    slLine    := line.new(tradeEntryBar, tradeSL, bar_index, tradeSL, color = color.red, style = line.style_dotted, width = 3, extend = extend.right)
+    tpLine    := line.new(tradeEntryBar, tradeTP, bar_index, tradeTP, color = color.lime, style = line.style_dotted, width = 3, extend = extend.right)
+
+// ----------------------------------------------------------------------------
+// Resolve win/loss - SL takes priority if both are touched on the same bar
+// (can't know intrabar order from OHLC alone, so assume the worst case).
+// ----------------------------------------------------------------------------
+bool   tradeClosed = false
+string closeText   = na
+float  closeR      = na
+
+if tradeActive and barstate.isconfirmed
+    hitSL = tradeIsLong ? low <= tradeSL : high >= tradeSL
+    hitTP = tradeIsLong ? high >= tradeTP : low <= tradeTP
+    if hitSL
+        losses += 1
+        tradeClosed := true
+        closeR      := -1.0
+        closeText   := "❌ LOSS"
+        tradeActive := false
+    else if hitTP
+        wins += 1
+        risk = math.abs(tradeEntry - tradeSL)
+        r    = risk > 0 ? (tradeIsLong ? (tradeTP - tradeEntry) / risk : (tradeEntry - tradeTP) / risk) : na
+        tradeClosed := true
+        closeR      := r
+        closeText   := "✅ WIN" + (na(r) ? "" : " " + str.tostring(r, "#.00") + "R")
+        tradeActive := false
+
+if tradeClosed
+    label.new(bar_index, closeR > 0 ? high + atrVal : low - atrVal, closeText,
+      style = closeR > 0 ? label.style_label_down : label.style_label_up,
+      color = color.new(closeR > 0 ? color.green : color.red, 0), textcolor = color.white, size = size.small)
+    line.set_extend(entryLine, extend.none)
+    line.set_extend(slLine, extend.none)
+    line.set_extend(tpLine, extend.none)
+    line.set_x2(entryLine, bar_index + 20)
+    line.set_x2(slLine, bar_index + 20)
+    line.set_x2(tpLine, bar_index + 20)
+    entryLine := na
+    slLine    := na
+    tpLine    := na
+
+resolvedTrades = wins + losses
+winrate = resolvedTrades > 0 ? wins * 100.0 / resolvedTrades : na
+
+// ----------------------------------------------------------------------------
+// Tracked FVG box - draws the fresh FVG once found (the actual retest zone),
+// not the approach-leg one, since that's the level worth watching on chart.
+// ----------------------------------------------------------------------------
+if showFvgBox
+    if not na(entryFvg)
+        boxColor = setupDir == "long" ? color.new(color.teal, 85) : color.new(color.maroon, 85)
+        borderColor = setupDir == "long" ? color.teal : color.maroon
+        if na(fvgBox)
+            fvgBox := box.new(entryFvg.barIndex, entryFvg.top, bar_index, entryFvg.bottom,
+              border_color = borderColor, bgcolor = boxColor, border_width = 1, border_style = line.style_dashed)
+        else
+            box.set_right(fvgBox, bar_index)
+    else if not na(fvgBox)
+        fvgBox := na
+
+// ----------------------------------------------------------------------------
+// Dashboard
+// ----------------------------------------------------------------------------
+chartTfOk = timeframe.period == "1" or timeframe.period == "5"
+
+f_dirText(dir) => dir == "long" ? "🟢 LONG" : dir == "short" ? "🔴 SHORT" : "— none —"
+f_dirColor(dir) => dir == "long" ? color.lime : dir == "short" ? color.red : color.gray
+
+if showStatsTable and barstate.islast
+    var table dash = table.new(position.top_right, 2, 9, border_width = 1, border_color = #000000, frame_width = 1, frame_color = #000000, bgcolor = #131722)
+    bgSolid = #131722
+    stateText = tradeActive ? "💰 Trade Active" : awaitingRetest ? "⏳ Awaiting retest" : awaitingFreshFvg ? "🌀 Awaiting fresh FVG" : awaitingConfirm ? "🔎 Awaiting confirm" : "🔍 Searching"
+
+    table.cell(dash, 0, 0, "713 Indicator", text_color = color.white, bgcolor = #1e2a3a, text_size = size.tiny)
+    table.cell(dash, 1, 0, syminfo.ticker + " " + timeframe.period + (chartTfOk ? "" : " ⚠"), text_color = color.white, bgcolor = #1e2a3a, text_size = size.tiny)
+
+    table.cell(dash, 0, 1, "Status", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 1, stateText, text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 2, "Setup Dir", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 2, f_dirText(setupDir), text_color = f_dirColor(setupDir), bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 3, "Entry / SL / TP", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 3, (na(tradeEntry) ? "-" : str.tostring(tradeEntry, format.mintick)) + " / " + (na(tradeSL) ? "-" : str.tostring(tradeSL, format.mintick)) + " / " + (na(tradeTP) ? "-" : str.tostring(tradeTP, format.mintick)), text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 4, "Record", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 4, str.tostring(wins) + "W " + str.tostring(losses) + "L (" + (not na(winrate) ? str.tostring(winrate, "#.0") + "%" : "N/A") + ")", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 5, "Skipped (no target)", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 5, str.tostring(skippedNoTarget), text_color = color.gray, bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 6, "Skipped (no fresh FVG)", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 6, str.tostring(skippedNoFreshFvg), text_color = color.gray, bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 7, "Skipped (bad geometry)", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 7, str.tostring(skippedBadGeometry), text_color = color.gray, bgcolor = bgSolid, text_size = size.tiny)
+
+    table.cell(dash, 0, 8, "Timeframe", text_color = color.white, bgcolor = bgSolid, text_size = size.tiny)
+    table.cell(dash, 1, 8, chartTfOk ? "OK (" + timeframe.period + "m)" : "⚠ built for 1m/5m", text_color = chartTfOk ? color.lime : color.orange, bgcolor = bgSolid, text_size = size.tiny)
+
+// ----------------------------------------------------------------------------
+// Optional debug table - off by default, verification only.
+// ----------------------------------------------------------------------------
+var table dbg = table.new(position.bottom_right, 2, 5, border_width = 1)
+
+if debugTable and barstate.islast
+    table.cell(dbg, 0, 0, "Level", bgcolor = color.gray)
+    table.cell(dbg, 1, 0, "Value", bgcolor = color.gray)
+    table.cell(dbg, 0, 1, "Asia H/L" + (asiaHighSwept or asiaLowSwept ? " (swept: " + (asiaHighSwept ? "H" : "") + (asiaLowSwept ? "L" : "") + ")" : ""))
+    table.cell(dbg, 1, 1, str.tostring(asiaHigh) + " / " + str.tostring(asiaLow))
+    table.cell(dbg, 0, 2, "London H/L" + (londonHighSwept or londonLowSwept ? " (swept: " + (londonHighSwept ? "H" : "") + (londonLowSwept ? "L" : "") + ")" : ""))
+    table.cell(dbg, 1, 2, str.tostring(londonHigh) + " / " + str.tostring(londonLow))
+    table.cell(dbg, 0, 3, "Midnight Open")
+    table.cell(dbg, 1, 3, str.tostring(midnightOpen))
+    table.cell(dbg, 0, 4, "Pending FVGs (bull/bear)")
+    table.cell(dbg, 1, 4, str.tostring(array.size(pendingBull)) + " / " + str.tostring(array.size(pendingBear)))
+
+// ----------------------------------------------------------------------------
+// Alerts - same pattern as v2.1. "Armed" fires once the fresh FVG is found
+// and staged (the moment entry/SL/TP become known), not at initial
+// confirmation - see the staging comment above for why entry/SL/TP aren't
+// known until then.
+// ----------------------------------------------------------------------------
+var int  lastAlertBar       = na
+var bool lastArmWasNotified = false
+
+if justArmed
+    notifyThis = na(lastAlertBar) or (bar_index - lastAlertBar) >= alertCooldownBars
+    if setupDir == "long"
+        longMsg = "🟢 " + syminfo.ticker + " LONG SETUP (713)\n📍 Limit Buy: " + str.tostring(stagedSetupEntry, format.mintick) +
+          "\n🛑 Stop: " + str.tostring(setupSL, format.mintick) + "\n🎯 Target: " + str.tostring(stagedSetupTP, format.mintick) +
+          "\n{\"event\":\"armed\",\"symbol\":\"" + syminfo.ticker + "\",\"direction\":\"long\",\"entry\":" +
+          str.tostring(stagedSetupEntry, format.mintick) + ",\"stop\":" + str.tostring(setupSL, format.mintick) +
+          ",\"target\":" + str.tostring(stagedSetupTP, format.mintick) + "}"
+        if notifyThis
+            alert(longMsg, alert.freq_once_per_bar)
+    else
+        shortMsg = "🔴 " + syminfo.ticker + " SHORT SETUP (713)\n📍 Limit Sell: " + str.tostring(stagedSetupEntry, format.mintick) +
+          "\n🛑 Stop: " + str.tostring(setupSL, format.mintick) + "\n🎯 Target: " + str.tostring(stagedSetupTP, format.mintick) +
+          "\n{\"event\":\"armed\",\"symbol\":\"" + syminfo.ticker + "\",\"direction\":\"short\",\"entry\":" +
+          str.tostring(stagedSetupEntry, format.mintick) + ",\"stop\":" + str.tostring(setupSL, format.mintick) +
+          ",\"target\":" + str.tostring(stagedSetupTP, format.mintick) + "}"
+        if notifyThis
+            alert(shortMsg, alert.freq_once_per_bar)
+    if notifyThis
+        lastAlertBar := bar_index
+    lastArmWasNotified := notifyThis
+
+if justInvalidated and lastArmWasNotified
+    if setupDir == "long"
+        alert("⚪ " + syminfo.ticker + " LONG invalidated (713)\n❌ Cancel your resting BUY order" +
+          "\n{\"event\":\"invalidated\",\"symbol\":\"" + syminfo.ticker + "\",\"direction\":\"long\"}", alert.freq_once_per_bar)
+    else
+        alert("⚪ " + syminfo.ticker + " SHORT invalidated (713)\n❌ Cancel your resting SELL order" +
+          "\n{\"event\":\"invalidated\",\"symbol\":\"" + syminfo.ticker + "\",\"direction\":\"short\"}", alert.freq_once_per_bar)
+
+alertcondition(justEntered and tradeIsLong, title = "713 Indicator Long Entry (filled)", message = "713 Indicator LONG filled — check chart for SL/TP")
+alertcondition(justEntered and not tradeIsLong, title = "713 Indicator Short Entry (filled)", message = "713 Indicator SHORT filled — check chart for SL/TP")
